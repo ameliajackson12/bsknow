@@ -109,10 +109,12 @@ import ssl
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime
 from urllib.parse import urljoin
 
+import grapheme          # NEW – correct Bluesky grapheme counting
 import requests
 from bs4 import BeautifulSoup
 from atproto import Client, models
@@ -208,6 +210,7 @@ CREDENTIALS_HEADER = [
     "ACCOUNT_STATUS", "ACCOUNT_STATUS_AT",
     "ASSIGNED_REPO", "ASSIGNED_STATUS", "ASSIGNED_AT",
     "PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT",
+    "VIDEO_COUNT_TODAY", "VIDEO_COUNT_DATE",
 ]
 
 # Base columns for a brand-new Proxies tab (only used if the tab doesn't
@@ -249,6 +252,22 @@ DEFAULT_SETTINGS = [
     ("USE_PROXY", "true"),
     ("PROXY_REQUIRED", "true"),
     ("PROXY_CHECK_TIMEOUT_SECONDS", "10"),
+    # Video daily limit: 0 = unlimited. Once an account has posted this many
+    # videos today (UTC), choose_media_kind() will skip "video" and pick
+    # image/previewLink instead. Posting continues normally for other types.
+    ("MAX_VIDEOS_PER_DAY", "0"),
+    # Link style for media posts that include a link:
+    #   "rich"   = always rich text with display text
+    #   "plain"  = always the raw URL as the clickable text
+    #   "random" = 50/50 (legacy behaviour)
+    ("LINK_STYLE", "random"),
+    # If true, rich links ONLY use the account's LINK_DISPLAY_TEXT (no random
+    # "Live Models" / "Private Show" etc. options). Ignored when LINK_STYLE=plain.
+    ("LINK_DISPLAY_TEXT_ONLY", "false"),
+    # If true (default), the action line + link sit on a new paragraph after the
+    # body caption. If false, they are appended inline (same paragraph) after
+    # the body caption with a single space.
+    ("LINK_ON_NEW_LINE", "true"),
 ]
 
 POSTED_STATUS_VALUE = "posted"
@@ -785,6 +804,14 @@ def load_account_config(force_refresh=False):
         "proxy_ip":             col("PROXY_IP"),
         "proxy_port":           col("PROXY_PORT"),
         "proxy_assigned_at":    col("PROXY_ASSIGNED_AT"),
+
+        # ── Video daily limit + link presentation ──────────────────────────
+        "max_videos_per_day":   _parse_int(setting("MAX_VIDEOS_PER_DAY"), 0),  # 0 = unlimited
+        "link_style":           (setting("LINK_STYLE") or "random").strip().lower(),
+        "link_display_text_only": _parse_bool(setting("LINK_DISPLAY_TEXT_ONLY"), False),
+        "link_on_new_line":     _parse_bool(setting("LINK_ON_NEW_LINE"), True),
+        "video_count_today":    col("VIDEO_COUNT_TODAY"),
+        "video_count_date":     col("VIDEO_COUNT_DATE"),
     }
 
     if not cfg["handle"]:
@@ -1281,6 +1308,11 @@ def build_bsky_client(proxy_url):
     ):
         try:
             req = AtprotoRequest(**kwargs)
+            # Give slow connections / large video uploads more breathing room
+            try:
+                req._client.timeout = 120.0
+            except Exception:
+                pass
             return Client(request=req)
         except TypeError as exc:
             last_exc = exc
@@ -1366,6 +1398,15 @@ def print_config_summary():
         proxy_display = f"{cfg.get('proxy_ip') or '—'}:{cfg.get('proxy_port') or '—'}"
         print(f"  Current proxy:            {proxy_display}")
         print(f"  Proxy check timeout:      {cfg.get('proxy_check_timeout', 10)}s")
+    max_v = cfg.get("max_videos_per_day", 0)
+    if max_v > 0:
+        used = get_video_count_today()
+        print(f"  Video daily limit:        {used}/{max_v} (UTC day)")
+    else:
+        print(f"  Video daily limit:        unlimited")
+    print(f"  Link style:               {cfg.get('link_style', 'random')}"
+          f"{' (custom display text only)' if cfg.get('link_display_text_only') else ''}")
+    print(f"  Link placement:           {'new line' if cfg.get('link_on_new_line', True) else 'inline with caption'}")
     print(f"  Sheets retry budget:      {SHEETS_RETRY_BUDGET_SECONDS}s per call "
           f"(max backoff {SHEETS_MAX_BACKOFF_SECONDS}s)")
     print("─────────────────────────────────────────────────")
@@ -1374,6 +1415,16 @@ def print_config_summary():
 # ═══════════════════════════════════════════════════════════════════════════
 #  REPORT TAB
 # ═══════════════════════════════════════════════════════════════════════════
+# Columns (fixed, 1-based):
+#   A Timestamp (UTC) | B Handle | C Followers | D Gained
+#   E Top Post        | F Engagement | G Status
+#
+# Writing strategy: never rely on Sheets "table detection" via append to A:G
+# (that is what caused rows to land in the wrong columns when the sheet had
+# extra blank columns, filters, or a mismatched header). Instead we:
+#   1. Ensure the header row is exactly REPORT_HEADER.
+#   2. Find the next empty data row by reading column A.
+#   3. Write the 7 values into that exact A{n}:G{n} range with values.update.
 
 def _now_str():
     return time.strftime("%Y-%m-%d %H:%M", time.gmtime()) + " UTC"
@@ -1385,12 +1436,61 @@ def _parse_report_ts(s):
         return None
 
 
+def _normalize_handle(h):
+    """Compare handles without a leading @ and case-insensitively."""
+    return (h or "").strip().lstrip("@").lower()
+
+
+def _sanitize_report_text(s, max_len=200):
+    """Collapse whitespace/newlines so Top Post stays in a single clean cell."""
+    if s is None:
+        return ""
+    text = re.sub(r"[\r\n\t]+", " ", str(s))
+    text = re.sub(r" {2,}", " ", text).strip()
+    if len(text) > max_len:
+        text = text[: max_len - 1] + "…"
+    return text
+
+
+def ensure_report_header():
+    """Make sure Report!A1:G1 is exactly REPORT_HEADER. Fixes a tab that was
+    created manually with extra/missing columns so new rows always land in
+    A–G under the right titles."""
+    res = sheets_get(qrange(REPORT_TAB, "1:1"))
+    rows = res.get("values", [])
+    existing = [str(c).strip() if c is not None else "" for c in (rows[0] if rows else [])]
+    # Pad / trim to 7 for comparison
+    existing_norm = (existing + [""] * 7)[:7]
+    expected = list(REPORT_HEADER)
+    if existing_norm == expected:
+        return
+    sheets_update(qrange(REPORT_TAB, "A1:G1"), [expected])
+    print(f"Report header repaired to: {expected}")
+
+
+def _next_report_row():
+    """Return the 1-based sheet row number where the next report entry should
+    be written (first empty cell in column A after the header)."""
+    res = sheets_get(qrange(REPORT_TAB, "A:A"))
+    values = res.get("values", [])
+    # values[0] is header (row 1). First completely empty row after that.
+    for i, row in enumerate(values):
+        if i == 0:
+            continue  # skip header
+        cell0 = str(row[0]).strip() if row and row[0] is not None else ""
+        if not cell0:
+            return i + 1  # 1-based
+    return len(values) + 1  # append after last used row
+
+
 def _last_report_for_handle(handle):
-    """Reads from the already-cached core data — no extra API call."""
+    """Reads from the already-cached core data — no extra API call.
+    Matches handle with or without leading @."""
     report_values = load_core_data()["report"]
+    target = _normalize_handle(handle)
     for r in range(len(report_values), 1, -1):
         h = cell(report_values, r, 2)
-        if h == handle:
+        if _normalize_handle(h) == target:
             ts = cell(report_values, r, 1)
             followers = None
             f_raw = cell(report_values, r, 3)
@@ -1416,8 +1516,48 @@ def _report_due(handle, times_per_day):
 
 
 def _append_report(rows):
-    sheets_append(qrange(REPORT_TAB, "A:G"), rows)
+    """Write one or more report rows into the correct A–G columns.
+
+    `rows` is a list of 7-element lists:
+      [Timestamp, Handle, Followers, Gained, Top Post, Engagement, Status]
+
+    Uses an explicit next-row `values.update` instead of `values.append` so
+    data cannot drift into extra columns when the sheet has blank columns,
+    filters, or a previously-mismatched header.
+    """
+    if not rows:
+        return
+    ensure_report_header()
+    start_row = _next_report_row()
+    # Normalize every row to exactly 7 columns with clean types
+    clean = []
+    for row in rows:
+        r = list(row) + [""] * 7
+        r = r[:7]
+        # A Timestamp, B Handle, C Followers, D Gained, E Top Post, F Engagement, G Status
+        ts       = str(r[0] or "")
+        handle   = str(r[1] or "").lstrip("@")  # store without leading @ for consistency
+        try:
+            followers = int(float(r[2])) if str(r[2]).strip() != "" else ""
+        except (ValueError, TypeError):
+            followers = str(r[2] or "")
+        try:
+            gained = int(float(r[3])) if str(r[3]).strip() != "" else ""
+        except (ValueError, TypeError):
+            gained = str(r[3] or "")
+        top_post = _sanitize_report_text(r[4], max_len=250)
+        try:
+            engagement = int(float(r[5])) if str(r[5]).strip() != "" else ""
+        except (ValueError, TypeError):
+            engagement = str(r[5] or "")
+        status = str(r[6] or "")
+        clean.append([ts, handle, followers, gained, top_post, engagement, status])
+
+    end_row = start_row + len(clean) - 1
+    rng = qrange(REPORT_TAB, f"A{start_row}:G{end_row}")
+    sheets_update(rng, clean)
     load_core_data(force=True)   # refresh cache so subsequent checks this cycle see the new row
+    print(f"Report row(s) written to {REPORT_TAB}!A{start_row}:G{end_row}")
 
 
 def _top_post_summary(client, handle, top_n, within):
@@ -1452,12 +1592,12 @@ def _top_post_summary(client, handle, top_n, within):
 
     if len(ranked) == 1:
         p = ranked[0]
-        preview = p["text"][:100] + ("…" if len(p["text"]) > 100 else "")
+        preview = _sanitize_report_text(p["text"], max_len=100)
         return preview, p["engagement"]
 
     parts = []
     for i, p in enumerate(ranked, start=1):
-        preview = p["text"][:60] + ("…" if len(p["text"]) > 60 else "")
+        preview = _sanitize_report_text(p["text"], max_len=60)
         parts.append(f"{i}) {preview} ({p['engagement']})")
     return " | ".join(parts), ranked[0]["engagement"]
 
@@ -1470,7 +1610,7 @@ def generate_report(client, handle, cfg):
         return
     try:
         profile = client.get_profile(actor=handle)
-        total   = profile.followers_count or 0
+        total   = int(profile.followers_count or 0)
 
         _, prev_followers = _last_report_for_handle(handle)
         prev   = prev_followers if prev_followers is not None else total
@@ -1480,12 +1620,22 @@ def generate_report(client, handle, cfg):
             client, handle, cfg["top_posts_count"], cfg["top_posts_within"]
         )
 
-        row = [_now_str(), handle, total, gained, top_preview, top_engagement, "OK"]
+        # Exactly 7 columns matching REPORT_HEADER / A–G
+        row = [
+            _now_str(),          # A Timestamp (UTC)
+            handle.lstrip("@"),  # B Handle (no leading @)
+            total,               # C Followers (number)
+            gained,              # D Gained (number)
+            top_preview,         # E Top Post (single-line text)
+            int(top_engagement or 0),  # F Engagement (number)
+            "OK",                # G Status
+        ]
         _append_report([row])
         print(f"Report logged for {handle}: {total} followers ({gained:+d} since last), "
               f"top post engagement={top_engagement}.")
     except Exception as exc:
         print(f"Warning: report generation failed: {exc}")
+        traceback.print_exc()
 
 
 def run_report(client, handle, cfg):
@@ -1665,16 +1815,29 @@ def choose_caption_and_link_style(sheet_caption, add_link):
         return body_caption, "", None, None
 
     action_line = generate_action_line()
-    # Exactly one link style: rich display text OR plain actual URL — never both.
-    link_mode = random.choice(["rich", "plain"])
+
+    # Honour LINK_STYLE setting: "rich" | "plain" | "random"
+    style = (cfg.get("link_style") or "random").strip().lower()
+    if style == "rich":
+        link_mode = "rich"
+    elif style == "plain":
+        link_mode = "plain"
+    else:
+        link_mode = random.choice(["rich", "plain"])
+
     rich_display = None
     if link_mode == "rich":
         account_display = (cfg.get("link_display_text") or "").strip()
         bare_url = (cfg.get("link_url") or "").replace("https://", "").replace("http://", "").lower()
-        if account_display and account_display.lower() not in (bare_url, ""):
-            rich_display = account_display if random.random() < 0.55 else random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+        only_custom = cfg.get("link_display_text_only", False)
+        if only_custom:
+            # Strict: only the account's configured display text (or a safe fallback)
+            rich_display = account_display if account_display and account_display.lower() not in (bare_url, "") else "Live Models"
         else:
-            rich_display = random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+            if account_display and account_display.lower() not in (bare_url, ""):
+                rich_display = account_display if random.random() < 0.55 else random.choice(_RICH_LINK_DISPLAY_OPTIONS)
+            else:
+                rich_display = random.choice(_RICH_LINK_DISPLAY_OPTIONS)
 
     return body_caption, action_line, link_mode, rich_display
 
@@ -1695,13 +1858,80 @@ def should_add_link(kind):
 #  POST-TYPE SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
 
-def choose_media_kind():
+def _today_utc_str():
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def get_video_count_today():
+    """Return how many videos this account has already posted today (UTC).
+    Resets automatically when the stored date is not today."""
     cfg = _cfg()
-    return random.choices(
-        ["image", "video", "previewLink"],
-        weights=[cfg["image_ratio"], cfg["video_ratio"], cfg["link_ratio"]],
-        k=1,
-    )[0]
+    max_v = cfg.get("max_videos_per_day", 0)
+    if max_v <= 0:
+        return 0  # unlimited → treat as 0 used
+    today = _today_utc_str()
+    stored_date = (cfg.get("video_count_date") or "").strip()
+    if stored_date != today:
+        return 0
+    try:
+        return max(0, int(float(cfg.get("video_count_today") or "0")))
+    except (ValueError, TypeError):
+        return 0
+
+
+def increment_video_count():
+    """After a successful video post, bump VIDEO_COUNT_TODAY for this account."""
+    global _account_config
+    cfg = _cfg()
+    max_v = cfg.get("max_videos_per_day", 0)
+    if max_v <= 0:
+        return  # unlimited — no need to track
+    today = _today_utc_str()
+    current = get_video_count_today()
+    new_count = current + 1
+
+    core = load_core_data(force=True)
+    header = hmap(core["creds"])
+    count_col = header.get("VIDEO_COUNT_TODAY")
+    date_col  = header.get("VIDEO_COUNT_DATE")
+    if count_col is None or date_col is None:
+        print("Warning: VIDEO_COUNT_TODAY / VIDEO_COUNT_DATE columns missing — cannot track video limit.")
+        return
+    excel_row = ACCOUNT_ROW + 1
+    sheets_batch_update_values([
+        {"range": qrange(CREDS_TAB, f"{col_letter(count_col)}{excel_row}"), "values": [[str(new_count)]]},
+        {"range": qrange(CREDS_TAB, f"{col_letter(date_col)}{excel_row}"),  "values": [[today]]},
+    ])
+    if _account_config:
+        _account_config["video_count_today"] = str(new_count)
+        _account_config["video_count_date"]  = today
+    print(f"Video count for today updated: {new_count}/{max_v}")
+
+
+def choose_media_kind():
+    """Pick image / video / previewLink according to ratios, but never
+    choose 'video' once the account has already hit MAX_VIDEOS_PER_DAY
+    today. Other post types continue normally."""
+    cfg = _cfg()
+    max_v = cfg.get("max_videos_per_day", 0)
+    used  = get_video_count_today() if max_v > 0 else 0
+    video_allowed = (max_v <= 0) or (used < max_v)
+
+    kinds   = ["image", "video", "previewLink"]
+    weights = [cfg["image_ratio"], cfg["video_ratio"], cfg["link_ratio"]]
+
+    if not video_allowed:
+        print(f"Video daily limit reached ({used}/{max_v}) — skipping video this cycle, "
+              f"will post image or previewLink instead.")
+        # Zero out video weight and re-normalise the remaining two
+        weights = [cfg["image_ratio"], 0.0, cfg["link_ratio"]]
+        total = sum(weights)
+        if total <= 0:
+            # Degenerate case: only video was configured — fall back to image
+            return "image"
+        weights = [w / total for w in weights]
+
+    return random.choices(kinds, weights=weights, k=1)[0]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2035,6 +2265,13 @@ def _compress_link_thumb(data, max_bytes):
 
 
 MAX_POST_GRAPHEMES = 300
+SAFETY_MARGIN = 5   # leave a few graphemes of headroom for Bluesky's stricter counting
+
+
+def grapheme_len(s: str) -> int:
+    """Correct Unicode grapheme cluster count (what Bluesky actually enforces)."""
+    return grapheme.length(s)
+
 
 def build_link_caption_text(caption, tags, fallback_url=None):
     text = _URL_RE.sub("", caption or "").strip(" \t\r")
@@ -2053,15 +2290,32 @@ def build_link_caption_text(caption, tags, fallback_url=None):
                 tb.text(" ")
 
     plain = tb.build_text()
-    if len(plain) > MAX_POST_GRAPHEMES:
+    if grapheme_len(plain) > MAX_POST_GRAPHEMES - SAFETY_MARGIN:
         hashtag_block = ("\n\n" + " ".join(f"#{t}" for t in tags)) if tags else ""
-        budget = MAX_POST_GRAPHEMES - len(hashtag_block)
-        trimmed = (text[:max(0, budget - 1)].rstrip() + "…") if budget > 0 else ""
+        budget = MAX_POST_GRAPHEMES - SAFETY_MARGIN - grapheme_len(hashtag_block)
+        # Trim the text part to fit within the remaining budget
+        if budget > 0 and text:
+            # Simple binary search on character positions (good enough)
+            lo, hi, best = 0, len(text), ""
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                trial = text[:mid].rstrip()
+                if mid < len(text):
+                    trial += "…"
+                if grapheme_len(trial) <= budget:
+                    best = trial
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            text = best
+        else:
+            text = ""
+
         tb = TextBuilder()
-        if trimmed:
-            tb.text(trimmed)
+        if text:
+            tb.text(text)
         if tags:
-            if trimmed:
+            if text:
                 tb.text("\n\n")
             for i, tag in enumerate(tags):
                 tb.tag(f"#{tag}", tag)
@@ -2251,29 +2505,32 @@ def release_claim(claimed_name, original_name):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_post_from_caption(body_caption, action_line, tags, link_mode=None, rich_display=None):
-    """Build rich-text post in the exact layout:
-
-        <body caption>
-
-        💖 action words 😘 <rich link OR plain URL>
-
-        #hashtags...
+    """
+    Priority when the post is too long:
+      1. Keep full body caption (highest priority)
+      2. Keep as many hashtags as possible (drop only the ones that overflow)
+      3. Drop action line if still needed
+      4. Only as last resort → trim body caption
     """
     cfg = _cfg()
     text = replace_mentions(body_caption) if body_caption else ""
     text = _URL_RE.sub("", text).strip() if text else ""
+    tags = tags or []
 
-    def _assemble(caption_text):
+    on_new_line = cfg.get("link_on_new_line", True)
+
+    def _assemble(caption_text, use_action=True, tag_list=None):
         tb = TextBuilder()
         if caption_text:
             tb.text(caption_text)
 
-        # Action line + single CLICKABLE link (never plain non-clickable text).
-        # Both modes use app.bsky.richtext.facet#link via TextBuilder.link():
-        #   "rich"  → custom anchor text (e.g. "Live Models") → URL
-        #   "plain" → URL text itself is the clickable link     → URL
-        if link_mode in ("rich", "plain"):
-            tb.text("\n\n")
+        if link_mode in ("rich", "plain") and use_action:
+            if on_new_line:
+                tb.text("\n\n")
+            else:
+                # Inline: single space after body caption
+                if caption_text:
+                    tb.text(" ")
             if action_line:
                 tb.text(action_line + " ")
             url = cfg["link_url"]
@@ -2281,38 +2538,79 @@ def build_post_from_caption(body_caption, action_line, tags, link_mode=None, ric
                 display = (rich_display or cfg.get("link_display_text") or "Live Models").strip()
                 tb.link(display, url)
             else:
-                # URL string is both the visible text and the destination — real facet link
                 tb.link(url, url)
 
-        if tags:
+        if tag_list:
             tb.text("\n\n")
-            for i, tag in enumerate(tags):
+            for i, tag in enumerate(tag_list):
                 tb.tag(f"#{tag}", tag)
-                if i < len(tags) - 1:
+                if i < len(tag_list) - 1:
                     tb.text(" ")
         return tb
 
-    tb = _assemble(text)
-    plain = tb.build_text()
+    limit = MAX_POST_GRAPHEMES - SAFETY_MARGIN
 
-    if len(plain) > MAX_POST_GRAPHEMES:
-        lo, hi, best_text = 0, len(text), ""
+    # ── 1. Try full version ────────────────────────────────────────────────
+    tb = _assemble(text, use_action=True, tag_list=tags)
+    if grapheme_len(tb.build_text()) <= limit:
+        return tb
+
+    # ── 2. Keep full caption + action, reduce hashtags until it fits ───────
+    if tags:
+        # Binary search: find the maximum number of hashtags that still fit
+        lo, hi, best_n = 0, len(tags), 0
         while lo <= hi:
             mid = (lo + hi) // 2
-            trial = text[:mid].rstrip()
-            if mid < len(text):
-                trial += "…"
-            if len(_assemble(trial).build_text()) <= MAX_POST_GRAPHEMES:
-                best_text = trial
+            trial_tags = tags[:mid]
+            if grapheme_len(_assemble(text, use_action=True, tag_list=trial_tags).build_text()) <= limit:
+                best_n = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
-        print(f"Caption too long for post limit ({len(plain)} > {MAX_POST_GRAPHEMES}); "
-              f"trimmed caption to fit.")
-        tb = _assemble(best_text)
 
-    return tb
+        if best_n > 0:
+            print(f"Caption too long → kept {best_n}/{len(tags)} hashtags to fit limit.")
+            return _assemble(text, use_action=True, tag_list=tags[:best_n])
 
+    # ── 3. Drop action line, keep as many hashtags as possible ─────────────
+    if tags:
+        lo, hi, best_n = 0, len(tags), 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            trial_tags = tags[:mid]
+            if grapheme_len(_assemble(text, use_action=False, tag_list=trial_tags).build_text()) <= limit:
+                best_n = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        if best_n > 0:
+            print(f"Caption too long → dropped action line, kept {best_n}/{len(tags)} hashtags.")
+            return _assemble(text, use_action=False, tag_list=tags[:best_n])
+
+    # ── 4. No hashtags + no action line ────────────────────────────────────
+    tb = _assemble(text, use_action=False, tag_list=[])
+    if grapheme_len(tb.build_text()) <= limit:
+        print("Caption too long → dropped action line and all hashtags.")
+        return tb
+
+    # ── 5. Last resort: trim body caption ──────────────────────────────────
+    print(f"Caption still too long even after dropping hashtags/action "
+          f"({grapheme_len(tb.build_text())} graphemes). Trimming body caption…")
+
+    lo, hi, best_text = 0, len(text), ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        trial = text[:mid].rstrip()
+        if mid < len(text):
+            trial += "…"
+        if grapheme_len(_assemble(trial, use_action=False, tag_list=[]).build_text()) <= limit:
+            best_text = trial
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return _assemble(best_text, use_action=False, tag_list=[])
 
 def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_link):
     body_caption, action_line, link_mode, rich_display = choose_caption_and_link_style(caption, add_link)
@@ -2344,7 +2642,30 @@ def post_to_bluesky(client, media_name, local_path, kind, caption, tags, add_lin
 # ═══════════════════════════════════════════════════════════════════════════
 
 def run_discover():
+    """Discover which account rows THIS repo should run.
+
+    Sticky assignment rules (secure across multiple repositories sharing the
+    same sheet):
+
+      1. Accounts already ASSIGNED_REPO == CURRENT_REPO and not banned stay
+         owned by this repo forever (until you manually clear the columns).
+      2. Accounts assigned to ANY other repo are never touched by us.
+      3. Unassigned free accounts can be claimed by this repo, but only up to
+         the remaining slots under MAX_ACCOUNTS_PER_RUN.
+      4. MAX_ACCOUNTS_PER_RUN is the hard ceiling on how many jobs this
+         workflow will launch. Once a repo has claimed its quota, future
+         schedules of the same repo keep running exactly those same accounts
+         and never steal more.
+
+    This guarantees that two (or more) repos running the same workflow against
+    the same Google Sheet never fight over the same account rows.
+    """
     ensure_required_tabs()
+    # Make sure the assignment + video-tracking columns exist
+    ensure_extra_columns(CREDS_TAB, [
+        "ASSIGNED_REPO", "ASSIGNED_STATUS", "ASSIGNED_AT",
+        "VIDEO_COUNT_TODAY", "VIDEO_COUNT_DATE",
+    ])
 
     core = load_core_data(force=True)
     creds_values = core["creds"]
@@ -2361,6 +2682,9 @@ def run_discover():
 
     handle_col = hidx("BSKY_HANDLE")
     status_col = hidx("ACCOUNT_STATUS")
+    repo_col   = hidx("ASSIGNED_REPO")
+    astatus_col = hidx("ASSIGNED_STATUS")
+    at_col     = hidx("ASSIGNED_AT")
 
     if handle_col is None:
         print(f"::error::'{CREDS_TAB}' needs a 'BSKY_HANDLE' column.")
@@ -2374,42 +2698,104 @@ def run_discover():
             print(f"::error::FORCE_ACCOUNT_ROW={force_row!r} is not a valid row number.")
             sys.exit(1)
         print(f"FORCE_ACCOUNT_ROW set — running only row {eligible[0]} "
-              f"(eligibility filter and MAX_ACCOUNTS_PER_RUN cap skipped).")
+              f"(eligibility filter, assignment lock and MAX_ACCOUNTS_PER_RUN cap skipped).")
     else:
-        eligible = []
+        # ── Phase 1: collect rows already owned by THIS repo ──────────────
+        owned = []
+        free  = []   # candidate free rows we could claim
+
         for excel_row in range(2, len(creds_values) + 1):
             handle = cell(creds_values, excel_row, handle_col)
             if not handle:
                 continue
-            status = cell(creds_values, excel_row, status_col).lower() if status_col else ""
-            if any(marker in status for marker in SKIP_STATUS_MARKERS):
-                print(f"Skipping row {excel_row - 1} ({handle}) — status: {status!r}")
+            acct_status = cell(creds_values, excel_row, status_col).lower() if status_col else ""
+            if any(marker in acct_status for marker in SKIP_STATUS_MARKERS):
+                print(f"Skipping row {excel_row - 1} ({handle}) — status: {acct_status!r}")
                 continue
-            eligible.append(excel_row - 1)
 
-        if not eligible:
-            print(f"::error::No eligible account rows in '{CREDS_TAB}' "
-                  f"(all rows are empty or flagged banned/suspended).")
-            sys.exit(1)
+            assigned_repo = cell(creds_values, excel_row, repo_col) if repo_col else ""
+            assigned_status = cell(creds_values, excel_row, astatus_col) if astatus_col else ""
 
+            data_idx = excel_row - 1
+            if assigned_repo == CURRENT_REPO:
+                # Already ours — keep it (even if status column is weird)
+                owned.append(data_idx)
+                print(f"  Owned by us: row {data_idx} ({handle})")
+            elif assigned_repo and assigned_status.lower() == ASSIGN_STATUS_IN_USE.lower():
+                # Locked to another repo — never touch
+                print(f"  Locked by other repo '{assigned_repo}': row {data_idx} ({handle}) — skipped")
+            else:
+                # Free (unassigned or previously released)
+                free.append((data_idx, excel_row, handle))
+
+        # ── Phase 2: apply MAX_ACCOUNTS_PER_RUN ceiling ───────────────────
         limit_raw = get_env("MAX_ACCOUNTS_PER_RUN", required=False)
         if not limit_raw:
             limit_raw = core["settings"].get("MAX_ACCOUNTS_PER_RUN", "")
 
+        limit = None
         if limit_raw:
             try:
                 limit = max(1, int(limit_raw))
-                if limit < len(eligible):
-                    print(f"Capping this run to the first {limit} of "
-                          f"{len(eligible)} eligible accounts (MAX_ACCOUNTS_PER_RUN={limit}).")
-                eligible = eligible[:limit]
             except ValueError:
-                print(f"Warning: MAX_ACCOUNTS_PER_RUN={limit_raw!r} is not a valid "
-                      f"number — running all eligible rows.")
-        else:
-            print("MAX_ACCOUNTS_PER_RUN not set — running all eligible accounts.")
+                print(f"Warning: MAX_ACCOUNTS_PER_RUN={limit_raw!r} is not a valid number — no hard cap.")
 
-    print(f"Account rows for this workflow run: {eligible}")
+        if limit is not None:
+            print(f"MAX_ACCOUNTS_PER_RUN={limit} — this repo may run at most {limit} account(s).")
+            # Keep already-owned rows first (they may already exceed the limit if
+            # the setting was lowered later — we still honour existing ownership).
+            if len(owned) > limit:
+                print(f"Note: this repo already owns {len(owned)} accounts (more than the current "
+                      f"limit of {limit}). Continuing with all owned accounts; no new claims.")
+                eligible = owned
+            else:
+                slots_left = limit - len(owned)
+                # Claim additional free rows up to the remaining slots
+                to_claim = free[:slots_left]
+                for data_idx, excel_row, handle in to_claim:
+                    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                    data = []
+                    if repo_col is not None:
+                        data.append({"range": qrange(CREDS_TAB, f"{col_letter(repo_col)}{excel_row}"),
+                                     "values": [[CURRENT_REPO]]})
+                    if astatus_col is not None:
+                        data.append({"range": qrange(CREDS_TAB, f"{col_letter(astatus_col)}{excel_row}"),
+                                     "values": [[ASSIGN_STATUS_IN_USE]]})
+                    if at_col is not None:
+                        data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"),
+                                     "values": [[now]]})
+                    if data:
+                        sheets_batch_update_values(data)
+                    print(f"  Claimed free row {data_idx} ({handle}) for repo '{CURRENT_REPO}'.")
+                    owned.append(data_idx)
+                eligible = owned
+        else:
+            # No limit: keep all owned + claim every free row
+            for data_idx, excel_row, handle in free:
+                now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                data = []
+                if repo_col is not None:
+                    data.append({"range": qrange(CREDS_TAB, f"{col_letter(repo_col)}{excel_row}"),
+                                 "values": [[CURRENT_REPO]]})
+                if astatus_col is not None:
+                    data.append({"range": qrange(CREDS_TAB, f"{col_letter(astatus_col)}{excel_row}"),
+                                 "values": [[ASSIGN_STATUS_IN_USE]]})
+                if at_col is not None:
+                    data.append({"range": qrange(CREDS_TAB, f"{col_letter(at_col)}{excel_row}"),
+                                 "values": [[now]]})
+                if data:
+                    sheets_batch_update_values(data)
+                print(f"  Claimed free row {data_idx} ({handle}) for repo '{CURRENT_REPO}'.")
+                owned.append(data_idx)
+            eligible = owned
+
+        if not eligible:
+            print(f"::error::No eligible account rows for repo '{CURRENT_REPO}' in '{CREDS_TAB}'. "
+                  f"Either all accounts are banned/suspended, or they are already locked by "
+                  f"other repositories and this repo has none of its own.")
+            sys.exit(1)
+
+    print(f"Account rows for this workflow run (repo={CURRENT_REPO}): {eligible}")
     rows_csv = ",".join(str(r) for r in eligible)
 
     gh_output = os.environ.get("GITHUB_OUTPUT")
@@ -2545,6 +2931,8 @@ def run_once():
 
     mark_posted(original_name, row_num)
     move_file_to_processed(claimed_name, original_name)
+    if kind == "video":
+        increment_video_count()
     try:
         os.remove(path)
     except OSError:
@@ -2562,9 +2950,13 @@ def main():
 
     try:
         ensure_required_tabs()
-        ensure_extra_columns(CREDS_TAB, ["PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT"])
+        ensure_extra_columns(CREDS_TAB, [
+            "PROXY_IP", "PROXY_PORT", "PROXY_ASSIGNED_AT",
+            "VIDEO_COUNT_TODAY", "VIDEO_COUNT_DATE",
+        ])
         ensure_extra_columns(PROXIES_TAB, PROXY_TRACKING_COLUMNS)
         ensure_settings_defaults()
+        ensure_report_header()   # keep Report A1:G1 aligned so rows land in correct columns
         ACCOUNT_ROW = resolve_account_row()
         load_account_config()
     except Exception as exc:
@@ -2611,7 +3003,8 @@ def main():
             # We deliberately do NOT exit here — the whole point of the retry
             # budget + this catch-all is that a bad cycle (quota, transient
             # network blip, whatever) costs you one cycle, not the account.
-            print(f"Error during cycle: {exc}")
+            print(f"Error during cycle: {type(exc).__name__}: {exc}")
+            traceback.print_exc()          # ← full stack trace now visible in GitHub Actions logs
 
         loop_interval = (_account_config or {}).get("loop_interval_seconds", DEFAULT_LOOP_INTERVAL_SECONDS)
         # Small extra jitter on top of the configured interval so many
